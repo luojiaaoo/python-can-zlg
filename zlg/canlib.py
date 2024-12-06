@@ -1,3 +1,4 @@
+import time
 import can
 from . import zlgcan
 import logging
@@ -10,7 +11,14 @@ from can.exceptions import (
     CanInterfaceNotImplementedError,
     CanOperationError,
 )
+try:
+    from _overlapped import CreateEvent
+    from _winapi import WaitForSingleObject
 
+    HAS_EVENTS = True
+except ImportError:
+    WaitForSingleObject = None
+    HAS_EVENTS = False
 
 class CanIso:
     CAN_ISO = '0'
@@ -45,6 +53,7 @@ class ZlgUsbCanBus(BusABC):
     """
     single_device_handle = None
     chn_handles = []
+
     def __init__(
             self,
             channel: int,
@@ -109,6 +118,7 @@ class ZlgUsbCanBus(BusABC):
         # thread event
         self.event_recv_send_batch_zlg = threading.Event()
         # start thread for recv
+        self._recv_event = CreateEvent(None, 0, 0, None) if HAS_EVENTS else None
         threading.Thread(None, target=self.__recv_send_batch_zlg, args=(self.event_recv_send_batch_zlg,)).start()
         super().__init__(
             channel=channel,
@@ -151,7 +161,45 @@ class ZlgUsbCanBus(BusABC):
                     DataObj[i].zcanfddata.frame.data[j] = data[j]
             ret = self.zcanlib.TransmitData(ZlgUsbCanBus.single_device_handle, DataObj, len_msgs)
             log.debug(f"Tranmit Num: {ret}.")
-            # 接收
+            if HAS_EVENTS:
+                WaitForSingleObject(self._recv_event, 1)
+            else:
+                time.sleep(0.001)
+
+    def _apply_filters(self, filters: Optional[Dict]):
+        if filters is None:
+            return
+        for filter in filters:
+            self.__set_filter(filter)
+        self.__ack_filters()
+        self._is_filtered = True
+
+    def __set_filter(self, filter: Dict):
+        # 0 standard/1 extended
+        is_extended = int(filter['is_extended'])
+        filter_start = filter['filter_start']
+        filter_end = filter['filter_end']
+        ret = self.zcanlib.ZCAN_SetValue(ZlgUsbCanBus.single_device_handle, str(self.channel) + '/filter_mode', str(is_extended).encode('utf-8'))  # 扩展帧滤波
+        raise_can_operation_error(ret, f'Set CH{self.channel} filter_mode failed!')
+        ret = self.zcanlib.ZCAN_SetValue(ZlgUsbCanBus.single_device_handle, str(self.channel) + '/filter_start', hex(filter_start).encode('utf-8'))
+        raise_can_operation_error(ret, f'Set CH{self.channel}  filter_start failed!')
+        ret = self.zcanlib.ZCAN_SetValue(ZlgUsbCanBus.single_device_handle, str(self.channel) + '/filter_end', hex(filter_end).encode('utf-8'))
+        raise_can_operation_error(ret, f'Set CH{self.channel}  filter_end failed!')
+
+    def __ack_filters(self):
+        ret = self.zcanlib.ZCAN_SetValue(ZlgUsbCanBus.single_device_handle, str(self.channel) + '/filter_ack', '0'.encode('utf-8'))
+        raise_can_operation_error(ret, f'Set CH{self.channel} filter_ack failed!')
+
+    def flush_tx_buffer(self):
+        raise CanInterfaceNotImplementedError('flush_tx_buffer is not implemented')
+
+    def _recv_internal(self, timeout=None):
+        if self.queue_recv.qsize() > 0:
+            return self.queue_recv.get(), self._is_filtered or True
+        # 接收
+        is_ok = False
+        start_time = time.process_time()
+        while True:
             rcv_num = self.zcanlib.GetReceiveNum(self.chn_handle, zlgcan.ZCAN_TYPE_MERGE)
             if rcv_num:
                 read_cnt = MAX_RCV_NUM if rcv_num >= MAX_RCV_NUM else rcv_num
@@ -173,42 +221,14 @@ class ZlgUsbCanBus(BusABC):
                         is_rx=False if msg_zlg.zcanfddata.flag.txEchoed else True,
                     )
                     self.queue_recv.put(msg)
-            event.wait(timeout=0.005)
-
-    def _apply_filters(self, filters: Optional[Dict]):
-        if filters is None:
-            return
-        for filter in filters:
-            self.__set_filter(filter)
-        self.__ack_filters()
-        self._is_filtered = True
-
-    def __set_filter(self, filter: Dict):
-        # 0 standard/1 extended
-        is_extended = filter['is_extended']
-        filter_start = filter['filter_start']
-        filter_end = filter['filter_end']
-        ret = self.zcanlib.ZCAN_SetValue(ZlgUsbCanBus.single_device_handle, str(self.channel) + '/filter_mode', str(is_extended).encode('utf-8'))  # 扩展帧滤波
-        raise_can_operation_error(ret, f'Set CH{self.channel} filter_mode failed!')
-        ret = self.zcanlib.ZCAN_SetValue(ZlgUsbCanBus.single_device_handle, str(self.channel) + '/filter_start', hex(filter_start).encode('utf-8'))
-        raise_can_operation_error(ret, f'Set CH{self.channel}  filter_start failed!')
-        ret = self.zcanlib.ZCAN_SetValue(ZlgUsbCanBus.single_device_handle, str(self.channel) + '/filter_end', hex(filter_end).encode('utf-8'))
-        raise_can_operation_error(ret, f'Set CH{self.channel}  filter_end failed!')
-
-    def __ack_filters(self):
-        ret = self.zcanlib.ZCAN_SetValue(ZlgUsbCanBus.single_device_handle, str(self.channel) + '/filter_ack', '0'.encode('utf-8'))
-        raise_can_operation_error(ret, f'Set CH{self.channel} filter_ack failed!')
-
-    def flush_tx_buffer(self):
-        raise CanInterfaceNotImplementedError('flush_tx_buffer is not implemented')
-
-    def _recv_internal(self, timeout=None):
-        try:
-            msg = self.queue_recv.get(block=True, timeout=timeout)
-        except Empty:
-            return None, self._is_filtered or True  # todo
+                is_ok = True
+                break
+            if time.process_time() - start_time > timeout:
+                break
+        if is_ok:
+            return self.queue_recv.get(), self._is_filtered or True
         else:
-            return msg, self._is_filtered or True
+            return None, self._is_filtered or True
 
     @staticmethod
     def __trans_data2zlg(data, dlc: int):
