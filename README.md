@@ -7,3 +7,16 @@
    ```
 
 2. 将zlg文件夹拷贝到can/interfaces/文件夹下
+
+## example
+
+```python
+import can
+can_filters = [dict(is_extended=1, filter_start=UDS_PhysicalRequestID, filter_end=UDS_PhysicalRequestID),]
+bus = can.interface.Bus(bustype='zlg', channel=0, dev_type=39, fd=True,bitrate=500000,data_bitrate=2000000, receive_own_messages=True, can_filters=can_filters)
+msg = can.Message(arbitration_id=0x111,data=[0x02, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00],is_extended_id=False, )
+bus.send(msg)
+while (rec:=bus.recv(timeout=0.1)):
+    print(rec)
+bus.shutdown()
+```
