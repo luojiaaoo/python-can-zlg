@@ -199,7 +199,7 @@ class ZlgUsbCanBus(BusABC):
         # 接收
         is_ok = False
         start_time = time.process_time()
-        while True:
+        while not self.event_recv_send_batch_zlg.is_set():
             rcv_num = self.zcanlib.GetReceiveNum(self.chn_handle, zlgcan.ZCAN_TYPE_MERGE)
             if rcv_num:
                 read_cnt = MAX_RCV_NUM if rcv_num >= MAX_RCV_NUM else rcv_num
