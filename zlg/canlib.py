@@ -161,10 +161,10 @@ class ZlgUsbCanBus(BusABC):
                         DataObj[i].zcanfddata.frame.data[j] = data[j]
                 ret = self.zcanlib.TransmitData(ZlgUsbCanBus.single_device_handle, DataObj, send_size)
                 log.debug(f"Tranmit Num: {ret}.")
-                if HAS_EVENTS:
-                    WaitForSingleObject(self._recv_event, 1)
-                else:
-                    time.sleep(0.001)
+            if HAS_EVENTS:
+                WaitForSingleObject(self._recv_event, 1)
+            else:
+                time.sleep(0.001)
 
     def _apply_filters(self, filters: Optional[Dict]):
         if filters is None:
