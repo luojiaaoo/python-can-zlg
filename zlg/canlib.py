@@ -132,39 +132,39 @@ class ZlgUsbCanBus(BusABC):
             # 发送
             from ctypes import sizeof, memset
             send_size = self.queue_send.qsize()
-            msgs: List[can.Message] = []
-            for _ in range(send_size):
-                msgs.append(self.queue_send.get())
-            len_msgs = len(msgs)
-            DataObj = (zlgcan.ZCANDataObj * len_msgs)()
-            memset(DataObj, 0, sizeof(DataObj))
-            for i in range(len_msgs):
-                msg = msgs[i]
-                data = self.__trans_data2zlg(msg.data, msg.dlc)
-                DataObj[i].dataType = 1  # can报文
-                DataObj[i].chnl = self.channel
-                DataObj[i].zcanfddata.flag.frameType = 1 if msg.is_fd else 0  # 0-can,1-canfd
-                DataObj[i].zcanfddata.flag.txDelay = 0  # 不添加延迟
-                DataObj[i].zcanfddata.flag.txEchoRequest = 1  # 发送回显请求，0-不回显，1-回显
-                # DataObj[i].zcanfddata.flag.transmitType = TransmitType.ONCE
-                if self.retry_when_send_fail:
-                    DataObj[i].zcanfddata.flag.transmitType = TransmitType.NORMAL
+            if send_size:
+                msgs: List[can.Message] = []
+                for _ in range(send_size):
+                    msgs.append(self.queue_send.get())
+                DataObj = (zlgcan.ZCANDataObj * send_size)()
+                memset(DataObj, 0, sizeof(DataObj))
+                for i in range(send_size):
+                    msg = msgs[i]
+                    data = self.__trans_data2zlg(msg.data, msg.dlc)
+                    DataObj[i].dataType = 1  # can报文
+                    DataObj[i].chnl = self.channel
+                    DataObj[i].zcanfddata.flag.frameType = 1 if msg.is_fd else 0  # 0-can,1-canfd
+                    DataObj[i].zcanfddata.flag.txDelay = 0  # 不添加延迟
+                    DataObj[i].zcanfddata.flag.txEchoRequest = 1  # 发送回显请求，0-不回显，1-回显
+                    # DataObj[i].zcanfddata.flag.transmitType = TransmitType.ONCE
+                    if self.retry_when_send_fail:
+                        DataObj[i].zcanfddata.flag.transmitType = TransmitType.NORMAL
+                    else:
+                        DataObj[i].zcanfddata.flag.transmitType = TransmitType.ONCE
+                    DataObj[i].zcanfddata.frame.eff = 1 if msg.is_extended_id else 0  # 0-标准帧，1-扩展帧
+                    DataObj[i].zcanfddata.frame.rtr = 1 if msg.is_remote_frame else 0  # 0-数据帧，1-远程帧
+                    DataObj[i].zcanfddata.frame.can_id = msg.arbitration_id
+                    DataObj[i].zcanfddata.frame.len = msg.dlc
+                    if msg.is_fd:
+                        DataObj[i].zcanfddata.frame.brs = 1 if msg.bitrate_switch else 0  # BRS 加速标志位：0不加速，1加速
+                    for j in range(DataObj[i].zcanfddata.frame.len):
+                        DataObj[i].zcanfddata.frame.data[j] = data[j]
+                ret = self.zcanlib.TransmitData(ZlgUsbCanBus.single_device_handle, DataObj, send_size)
+                log.debug(f"Tranmit Num: {ret}.")
+                if HAS_EVENTS:
+                    WaitForSingleObject(self._recv_event, 1)
                 else:
-                    DataObj[i].zcanfddata.flag.transmitType = TransmitType.ONCE
-                DataObj[i].zcanfddata.frame.eff = 1 if msg.is_extended_id else 0  # 0-标准帧，1-扩展帧
-                DataObj[i].zcanfddata.frame.rtr = 1 if msg.is_remote_frame else 0  # 0-数据帧，1-远程帧
-                DataObj[i].zcanfddata.frame.can_id = msg.arbitration_id
-                DataObj[i].zcanfddata.frame.len = msg.dlc
-                if msg.is_fd:
-                    DataObj[i].zcanfddata.frame.brs = 1 if msg.bitrate_switch else 0  # BRS 加速标志位：0不加速，1加速
-                for j in range(DataObj[i].zcanfddata.frame.len):
-                    DataObj[i].zcanfddata.frame.data[j] = data[j]
-            ret = self.zcanlib.TransmitData(ZlgUsbCanBus.single_device_handle, DataObj, len_msgs)
-            log.debug(f"Tranmit Num: {ret}.")
-            if HAS_EVENTS:
-                WaitForSingleObject(self._recv_event, 1)
-            else:
-                time.sleep(0.001)
+                    time.sleep(0.001)
 
     def _apply_filters(self, filters: Optional[Dict]):
         if filters is None:
@@ -223,7 +223,7 @@ class ZlgUsbCanBus(BusABC):
                     self.queue_recv.put(msg)
                 is_ok = True
                 break
-            if time.process_time() - start_time > timeout:
+            if timeout is not None and time.process_time() - start_time > timeout:
                 break
         if is_ok:
             return self.queue_recv.get(), self._is_filtered or True
