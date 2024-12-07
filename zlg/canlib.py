@@ -225,6 +225,10 @@ class ZlgUsbCanBus(BusABC):
                 break
             if timeout is not None and time.process_time() - start_time > timeout:
                 break
+            if HAS_EVENTS:
+                WaitForSingleObject(self._recv_event, 1)
+            else:
+                time.sleep(0.001)
         if is_ok:
             return self.queue_recv.get(), self._is_filtered or True
         else:
