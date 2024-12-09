@@ -274,9 +274,19 @@ class ZlgUsbCanBus(BusABC):
         dev_type_name: str = param.get('Hardware Type', None)
         if 'USBCAN' not in dev_type_name:
             return []
-        dev_type_var_name: str = f'ZCAN_{dev_type_name.replace("-", "_")}'
-        dev_type: int = eval(f'zlgcan.{dev_type_var_name}')
         chn_num = int(param.get('CAN Number', None))
+        dev_type_var_name: str = f'ZCAN_{dev_type_name.replace("-", "_")}'
+        try:
+            dev_type: int = eval(f'zlgcan.{dev_type_var_name}')
+        except:
+            if chn_num == 1:
+                dev_type = zlgcan.ZCAN_USBCANFD_100U
+            elif chn_num == 2:
+                dev_type = zlgcan.ZCAN_USBCANFD_200U
+            elif chn_num == 4:
+                dev_type = zlgcan.ZCAN_USBCANFD_400U
+            elif chn_num == 8:
+                dev_type = zlgcan.ZCAN_USBCANFD_800U
         fd = 'CANFD' in dev_type_name.upper()
         serial = param.get('Serial', None)
         return [dict(interface='zlg', dev_type_name=dev_type_name, dev_type=dev_type, channel=i, fd=fd, serial=serial) for i in range(chn_num)]
