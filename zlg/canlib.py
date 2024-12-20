@@ -1,3 +1,4 @@
+from common.utilities import util_log
 import time
 import can
 from . import zlgcan
@@ -5,12 +6,14 @@ import logging
 from typing import Optional, Dict, List
 from can import BusABC
 import threading
-from queue import Queue, Empty
+from contextlib import contextmanager
+from queue import Queue
 from can.exceptions import (
     CanInitializationError,
     CanInterfaceNotImplementedError,
     CanOperationError,
 )
+
 try:
     from _overlapped import CreateEvent
     from _winapi import WaitForSingleObject
@@ -19,6 +22,7 @@ try:
 except ImportError:
     WaitForSingleObject = None
     HAS_EVENTS = False
+
 
 class CanIso:
     CAN_ISO = '0'
@@ -47,12 +51,27 @@ def raise_can_operation_error(ret: int, message):
         raise CanOperationError(message)
 
 
+
+@contextmanager
+def wait_lock_recv():
+    ZlgUsbCanBus.lock_recv.acquire()
+    try:
+        yield
+    except Exception as err:
+        raise err
+    finally:
+        ZlgUsbCanBus.lock_recv.release()
+
 class ZlgUsbCanBus(BusABC):
     """
-    The CAN Bus implemented for the Kvaser interface.
+    The CAN Bus implemented for the Zlgcan interface.
     """
     single_device_handle = None
     chn_handles = []
+    single_queue_send = Queue()
+    single_queue_recvs = [Queue() for i in range(16)]  # 最大16通道
+    event_recv_send_batch_zlg = None
+    lock_recv = threading.Lock()
 
     def __init__(
             self,
@@ -67,14 +86,15 @@ class ZlgUsbCanBus(BusABC):
             retry_when_send_fail_timeout_ms: int = 100,
             **kwargs,
     ):
+        self._recv_event = CreateEvent(None, 0, 0, None) if HAS_EVENTS else None
         self.channel = channel
         self.receive_own_messages = receive_own_messages
         self.retry_when_send_fail = retry_when_send_fail
         self.fd = fd
-        self.queue_recv = Queue()
-        self.queue_send = Queue()
         self.zcanlib = zlgcan.ZCAN()
+        flag_single = False
         if ZlgUsbCanBus.single_device_handle is None:
+            flag_single = True
             device_handle = self.zcanlib.OpenDevice(dev_type, 0, 0)  # 第二个参数是设备序号，默认0，只用第一个周立功
             if device_handle == zlgcan.INVALID_DEVICE_HANDLE:
                 raise CanInitializationError(f'fail to get device handle, device type {dev_type}') from None
@@ -115,11 +135,10 @@ class ZlgUsbCanBus(BusABC):
         # start can channel
         ret = self.zcanlib.StartCAN(self.chn_handle)
         raise_can_operation_error(ret, f'start CAN-Channel {channel} failed!')
-        # thread event
-        self.event_recv_send_batch_zlg = threading.Event()
-        # start thread for recv
-        self._recv_event = CreateEvent(None, 0, 0, None) if HAS_EVENTS else None
-        threading.Thread(None, target=self.__recv_send_batch_zlg, args=(self.event_recv_send_batch_zlg,)).start()
+        # start thread for send
+        if flag_single:
+            ZlgUsbCanBus.event_recv_send_batch_zlg = threading.Event()
+            threading.Thread(None, target=self.__recv_send_batch_zlg, args=(ZlgUsbCanBus.event_recv_send_batch_zlg,)).start()
         super().__init__(
             channel=channel,
             can_filters=can_filters,
@@ -131,18 +150,18 @@ class ZlgUsbCanBus(BusABC):
         while not event.is_set():
             # 发送
             from ctypes import sizeof, memset
-            send_size = self.queue_send.qsize()
+            send_size = ZlgUsbCanBus.single_queue_send.qsize()
             if send_size:
                 msgs: List[can.Message] = []
                 for _ in range(send_size):
-                    msgs.append(self.queue_send.get())
+                    msgs.append(ZlgUsbCanBus.single_queue_send.get())
                 DataObj = (zlgcan.ZCANDataObj * send_size)()
                 memset(DataObj, 0, sizeof(DataObj))
                 for i in range(send_size):
                     msg = msgs[i]
                     data = self.__trans_data2zlg(msg.data, msg.dlc)
                     DataObj[i].dataType = 1  # can报文
-                    DataObj[i].chnl = self.channel
+                    DataObj[i].chnl = msg.channel
                     DataObj[i].zcanfddata.flag.frameType = 1 if msg.is_fd else 0  # 0-can,1-canfd
                     DataObj[i].zcanfddata.flag.txDelay = 0  # 不添加延迟
                     DataObj[i].zcanfddata.flag.txEchoRequest = 1  # 发送回显请求，0-不回显，1-回显
@@ -194,45 +213,45 @@ class ZlgUsbCanBus(BusABC):
         raise CanInterfaceNotImplementedError('flush_tx_buffer is not implemented')
 
     def _recv_internal(self, timeout=None):
-        if self.queue_recv.qsize() > 0:
-            return self.queue_recv.get(), self._is_filtered or True
+        queue_recv = ZlgUsbCanBus.single_queue_recvs[self.channel]
+        if queue_recv.qsize() > 0:
+            return queue_recv.get(), self._is_filtered or True
         # 接收
-        is_ok = False
         start_time = time.process_time()
-        while not self.event_recv_send_batch_zlg.is_set():
-            rcv_num = self.zcanlib.GetReceiveNum(self.chn_handle, zlgcan.ZCAN_TYPE_MERGE)
-            if rcv_num:
-                read_cnt = MAX_RCV_NUM if rcv_num >= MAX_RCV_NUM else rcv_num
-                msgs_zlg, read_cnt = self.zcanlib.ReceiveData(ZlgUsbCanBus.single_device_handle, read_cnt)
-                for i in range(read_cnt):
-                    msg_zlg = msgs_zlg[i]
-                    if msg_zlg.dataType != 1:  # 筛选出can报文
-                        continue
-                    msg = can.Message(
-                        is_fd=bool(msg_zlg.zcanfddata.flag.frameType),
-                        timestamp=float(msg_zlg.zcanfddata.timestamp) / 1000000,
-                        is_extended_id=bool(msg_zlg.zcanfddata.frame.eff),
-                        is_error_frame=bool(msg_zlg.zcanfddata.frame.err),
-                        arbitration_id=msg_zlg.zcanfddata.frame.can_id,
-                        data=[msg_zlg.zcanfddata.frame.data[j] for j in range(msg_zlg.zcanfddata.frame.len)],
-                        dlc=msg_zlg.zcanfddata.frame.len,
-                        channel=self.channel,
-                        is_remote_frame=bool(msg_zlg.zcanfddata.frame.rtr),
-                        is_rx=False if msg_zlg.zcanfddata.flag.txEchoed else True,
-                    )
-                    self.queue_recv.put(msg)
-                is_ok = True
-                break
+        while not ZlgUsbCanBus.event_recv_send_batch_zlg.is_set():
+            with wait_lock_recv():
+                rcv_num = self.zcanlib.GetReceiveNum(self.chn_handle, zlgcan.ZCAN_TYPE_MERGE)
+                if rcv_num > 0:
+                    read_cnt = min(MAX_RCV_NUM, rcv_num)
+                    msgs_zlg, read_cnt_true = self.zcanlib.ReceiveData(ZlgUsbCanBus.single_device_handle, read_cnt)
+                    if read_cnt_true > 0:
+                        for i in range(read_cnt_true):
+                            msg_zlg = msgs_zlg[i]
+                            if msg_zlg.dataType not in (1, 2):  # 筛选出can报文，2代表错误帧
+                                continue
+                            msg = can.Message(
+                                is_fd=bool(msg_zlg.zcanfddata.flag.frameType),
+                                timestamp=float(msg_zlg.zcanfddata.timestamp) / 1000000,
+                                is_extended_id=bool(msg_zlg.zcanfddata.frame.eff),
+                                is_error_frame=bool(msg_zlg.zcanfddata.frame.err),
+                                arbitration_id=msg_zlg.zcanfddata.frame.can_id,
+                                data=[msg_zlg.zcanfddata.frame.data[j] for j in range(msg_zlg.zcanfddata.frame.len)],
+                                dlc=msg_zlg.zcanfddata.frame.len,
+                                channel=self.channel,
+                                is_remote_frame=bool(msg_zlg.zcanfddata.frame.rtr),
+                                is_rx=False if msg_zlg.zcanfddata.flag.txEchoed else True,
+                            )
+                            ZlgUsbCanBus.single_queue_recvs[msg_zlg.chnl].put(msg)
+                        if queue_recv.qsize() > 0:
+                            return queue_recv.get(), self._is_filtered or True
             if timeout is not None and time.process_time() - start_time > timeout:
                 break
+            # sleep
             if HAS_EVENTS:
                 WaitForSingleObject(self._recv_event, 1)
             else:
                 time.sleep(0.001)
-        if is_ok:
-            return self.queue_recv.get(), self._is_filtered or True
-        else:
-            return None, self._is_filtered or True
+        return None, self._is_filtered or True
 
     @staticmethod
     def __trans_data2zlg(data, dlc: int):
@@ -245,20 +264,29 @@ class ZlgUsbCanBus(BusABC):
         return data
 
     def send(self, msg: can.Message, timeout=None):
-        self.queue_send.put(msg)
+        msg.channel = self.channel
+        ZlgUsbCanBus.single_queue_send.put(msg)
 
     def shutdown(self):
         super().shutdown()
-        self.event_recv_send_batch_zlg.set()
         # Close CAN
         ret = self.zcanlib.ResetCAN(self.chn_handle)
         ZlgUsbCanBus.chn_handles.remove(self.chn_handle)
         if ret == 1:
             log.debug('Close CAN successfully.')
         if not ZlgUsbCanBus.chn_handles:
+            # stop send thread
+            ZlgUsbCanBus.event_recv_send_batch_zlg.set()
             # Close Device
             ret = self.zcanlib.CloseDevice(ZlgUsbCanBus.single_device_handle)
             ZlgUsbCanBus.single_device_handle = None
+            # clear send queue
+            for _ in range(ZlgUsbCanBus.single_queue_send.qsize()):
+                ZlgUsbCanBus.single_queue_send.get()
+            # clear send queue
+            for queue_recv in ZlgUsbCanBus.single_queue_recvs:
+                for _ in range(queue_recv.qsize()):
+                    queue_recv.get()
             if ret == 1:
                 log.debug("Close Device success! ")
 
@@ -281,12 +309,16 @@ class ZlgUsbCanBus(BusABC):
         except:
             if chn_num == 1:
                 dev_type = zlgcan.ZCAN_USBCANFD_100U
+                util_log.append_error_log_file_path(f'根据{dev_type_var_name}无法找到对应设备编号，自动退至ZCAN_USBCANFD_100U')
             elif chn_num == 2:
                 dev_type = zlgcan.ZCAN_USBCANFD_200U
+                util_log.append_error_log_file_path(f'根据{dev_type_var_name}无法找到对应设备编号，自动退至ZCAN_USBCANFD_200U')
             elif chn_num == 4:
                 dev_type = zlgcan.ZCAN_USBCANFD_400U
+                util_log.append_error_log_file_path(f'根据{dev_type_var_name}无法找到对应设备编号，自动退至ZCAN_USBCANFD_400U')
             elif chn_num == 8:
                 dev_type = zlgcan.ZCAN_USBCANFD_800U
+                util_log.append_error_log_file_path(f'根据{dev_type_var_name}无法找到对应设备编号，自动退至ZCAN_USBCANFD_800U')
         fd = 'CANFD' in dev_type_name.upper()
         serial = param.get('Serial', None)
         return [dict(interface='zlg', dev_type_name=dev_type_name, dev_type=dev_type, channel=i, fd=fd, serial=serial) for i in range(chn_num)]
