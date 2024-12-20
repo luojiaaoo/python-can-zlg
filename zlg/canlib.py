@@ -1,4 +1,3 @@
-from common.utilities import util_log
 import time
 import can
 from . import zlgcan
@@ -309,16 +308,16 @@ class ZlgUsbCanBus(BusABC):
         except:
             if chn_num == 1:
                 dev_type = zlgcan.ZCAN_USBCANFD_100U
-                util_log.append_error_log_file_path(f'根据{dev_type_var_name}无法找到对应设备编号，自动退至ZCAN_USBCANFD_100U')
+                log.debug(f'根据{dev_type_var_name}无法找到对应设备编号，自动退至ZCAN_USBCANFD_100U')
             elif chn_num == 2:
                 dev_type = zlgcan.ZCAN_USBCANFD_200U
-                util_log.append_error_log_file_path(f'根据{dev_type_var_name}无法找到对应设备编号，自动退至ZCAN_USBCANFD_200U')
+                log.debug(f'根据{dev_type_var_name}无法找到对应设备编号，自动退至ZCAN_USBCANFD_200U')
             elif chn_num == 4:
                 dev_type = zlgcan.ZCAN_USBCANFD_400U
-                util_log.append_error_log_file_path(f'根据{dev_type_var_name}无法找到对应设备编号，自动退至ZCAN_USBCANFD_400U')
+                log.debug(f'根据{dev_type_var_name}无法找到对应设备编号，自动退至ZCAN_USBCANFD_400U')
             elif chn_num == 8:
                 dev_type = zlgcan.ZCAN_USBCANFD_800U
-                util_log.append_error_log_file_path(f'根据{dev_type_var_name}无法找到对应设备编号，自动退至ZCAN_USBCANFD_800U')
+                log.debug(f'根据{dev_type_var_name}无法找到对应设备编号，自动退至ZCAN_USBCANFD_800U')
         fd = 'CANFD' in dev_type_name.upper()
         serial = param.get('Serial', None)
         return [dict(interface='zlg', dev_type_name=dev_type_name, dev_type=dev_type, channel=i, fd=fd, serial=serial) for i in range(chn_num)]
